@@ -213,7 +213,7 @@ async def _req(url: str, params: Mapping[str, Any]) -> Any:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 return response.json()
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as exc:
             exc_last = exc
             LOG.warning("AWC GET failed (try %d/%d): %s", i, attempts, exc.__class__.__name__)
         except httpx.HTTPStatusError as exc:
