@@ -208,7 +208,6 @@ async def _req(url: str, params: Mapping[str, Any]) -> Any:
             async with httpx.AsyncClient(
                 timeout=TIMEOUT,
                 headers=HEADERS,
-                http2=True,
             ) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
