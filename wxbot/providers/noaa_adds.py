@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import time
 from collections import defaultdict
 from functools import lru_cache
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 BASE_URL = "https://aviationweather.gov/adds/dataserver_current/httpparam"
+
+_CACHE_TTL_SECONDS = 90.0
+_RATE_LIMIT_INTERVAL = 1.0
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE_SECONDS = 1.0
 
 
 class NOAAServiceError(RuntimeError):
@@ -43,11 +50,60 @@ def _load_settings() -> NOAASettings:
         raise NOAAServiceError("Ошибка конфигурации NOAA ADDS") from exc
 
 
+class _CacheEntry(NamedTuple):
+    expires_at: float
+    value: Any
+
+
+_metar_cache: dict[tuple[str, ...], _CacheEntry] = {}
+_taf_cache: dict[tuple[str, ...], _CacheEntry] = {}
+_rate_lock = asyncio.Lock()
+_last_request_time: float = 0.0
+
+
+def _normalize_icaos(icaos: Sequence[str]) -> tuple[str, ...]:
+    return tuple(sorted({icao.upper() for icao in icaos}))
+
+
+def _get_cache_entry(cache: dict[tuple[str, ...], _CacheEntry], key: tuple[str, ...]) -> Any | None:
+    entry = cache.get(key)
+    if not entry:
+        return None
+    if entry.expires_at < time.monotonic():
+        cache.pop(key, None)
+        return None
+    return entry.value
+
+
+def _store_cache_entry(
+    cache: dict[tuple[str, ...], _CacheEntry],
+    key: tuple[str, ...],
+    value: Any,
+) -> None:
+    cache[key] = _CacheEntry(time.monotonic() + _CACHE_TTL_SECONDS, value)
+
+
+def _clone_metar_cache_value(value: Mapping[str, Mapping[str, list[str]]]) -> Mapping[str, Mapping[str, list[str]]]:
+    return {
+        "metar": {icao: list(reports) for icao, reports in value.get("metar", {}).items()},
+        "speci": {icao: list(reports) for icao, reports in value.get("speci", {}).items()},
+    }
+
+
+def _clone_taf_cache_value(value: Mapping[str, list[str]]) -> Mapping[str, list[str]]:
+    return {icao: list(reports) for icao, reports in value.items()}
+
+
 async def fetch_metar(icaos: Sequence[str]) -> Mapping[str, Mapping[str, list[str]]]:
     """Fetch METAR and SPECI reports for the given ICAO identifiers."""
 
     if not icaos:
         return {"metar": {}, "speci": {}}
+
+    key = _normalize_icaos(icaos)
+    cached = _get_cache_entry(_metar_cache, key)
+    if cached is not None:
+        return _clone_metar_cache_value(cached)
 
     params = {
         "dataSource": "metars",
@@ -73,7 +129,9 @@ async def fetch_metar(icaos: Sequence[str]) -> Mapping[str, Mapping[str, list[st
         else:
             metar_map[station_id].append(raw_text)
 
-    return {"metar": dict(metar_map), "speci": dict(speci_map)}
+    result = {"metar": dict(metar_map), "speci": dict(speci_map)}
+    _store_cache_entry(_metar_cache, key, result)
+    return _clone_metar_cache_value(result)
 
 
 async def fetch_taf(icaos: Sequence[str]) -> Mapping[str, list[str]]:
@@ -81,6 +139,11 @@ async def fetch_taf(icaos: Sequence[str]) -> Mapping[str, list[str]]:
 
     if not icaos:
         return {}
+
+    key = _normalize_icaos(icaos)
+    cached = _get_cache_entry(_taf_cache, key)
+    if cached is not None:
+        return _clone_taf_cache_value(cached)
 
     params = {
         "dataSource": "tafs",
@@ -100,7 +163,9 @@ async def fetch_taf(icaos: Sequence[str]) -> Mapping[str, list[str]]:
             continue
         taf_map[station_id].append(raw_text)
 
-    return dict(taf_map)
+    result = dict(taf_map)
+    _store_cache_entry(_taf_cache, key, result)
+    return _clone_taf_cache_value(result)
 
 
 async def fetch_metar_taf_speci(
@@ -128,21 +193,44 @@ async def _call_noaa(params: Mapping[str, str]) -> Mapping[str, Any]:
     """Perform a request to the NOAA ADDS endpoint."""
 
     settings = _load_settings()
-    try:
-        async with httpx.AsyncClient(timeout=settings.timeout) as client:
-            response = await client.get(settings.base_url, params=params)
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise NOAAServiceError("Таймаут запроса к NOAA ADDS") from exc
-    except httpx.HTTPStatusError as exc:
-        raise NOAAServiceError("Ответ NOAA ADDS содержит ошибку") from exc
-    except httpx.RequestError as exc:
-        raise NOAAServiceError("Не удалось подключиться к NOAA ADDS") from exc
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        await _respect_rate_limit()
+        try:
+            async with httpx.AsyncClient(timeout=settings.timeout) as client:
+                response = await client.get(settings.base_url, params=params)
+                response.raise_for_status()
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    if attempt == _MAX_ATTEMPTS:
+                        raise NOAAServiceError("Некорректный JSON от NOAA ADDS") from exc
+        except httpx.TimeoutException as exc:
+            if attempt == _MAX_ATTEMPTS:
+                raise NOAAServiceError("Таймаут запроса к NOAA ADDS") from exc
+        except httpx.HTTPStatusError as exc:
+            if attempt == _MAX_ATTEMPTS:
+                raise NOAAServiceError("Ответ NOAA ADDS содержит ошибку") from exc
+        except httpx.RequestError as exc:
+            if attempt == _MAX_ATTEMPTS:
+                raise NOAAServiceError("Не удалось подключиться к NOAA ADDS") from exc
 
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise NOAAServiceError("Некорректный JSON от NOAA ADDS") from exc
+        if attempt < _MAX_ATTEMPTS:
+            backoff = _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            await asyncio.sleep(backoff)
+
+    raise NOAAServiceError("NOAA ADDS: исчерпаны попытки запроса")
+
+
+async def _respect_rate_limit() -> None:
+    """Ensure a minimal delay between consecutive NOAA requests."""
+
+    global _last_request_time
+    async with _rate_lock:
+        now = time.monotonic()
+        wait_time = _RATE_LIMIT_INTERVAL - (now - _last_request_time)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        _last_request_time = time.monotonic()
 
 
 def _extract_reports(payload: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:

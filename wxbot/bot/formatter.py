@@ -5,9 +5,16 @@ from __future__ import annotations
 import html
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Mapping, Sequence
+from typing import Mapping, NamedTuple, Sequence
 
 FlightCategory = str
+
+
+class StationConditions(NamedTuple):
+    """Minimal METAR-derived conditions for a station."""
+
+    category: FlightCategory | None
+    age_hours: int | None
 
 AGE_PATTERN = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
 
@@ -38,17 +45,15 @@ def format_wx_bundle(bundle: Mapping[str, Mapping[str, Sequence[str]]]) -> str:
 def _format_header(icao: str, metars: Sequence[str], now: datetime) -> str:
     """Build the header line for a station, including flight category and METAR age."""
 
-    if not metars:
+    conditions = evaluate_station(metars, now)
+    if not metars or conditions.category is None:
         return f"<b>{html.escape(icao)}</b> [нет METAR]"
 
-    first_metar = metars[0]
-    visibility = _extract_visibility(first_metar)
-    ceiling = _extract_ceiling(first_metar)
-    category = _determine_flight_category(visibility, ceiling)
-    age_hours = _estimate_metar_age_hours(first_metar, now)
-    age_fragment = f"age~{age_hours}h" if age_hours is not None else "age~?h"
+    age_fragment = (
+        f"age~{conditions.age_hours}h" if conditions.age_hours is not None else "age~?h"
+    )
 
-    return f"<b>{html.escape(icao)}</b> [{category}, {age_fragment}]"
+    return f"<b>{html.escape(icao)}</b> [{conditions.category}, {age_fragment}]"
 
 
 def _format_reports_section(
@@ -169,4 +174,23 @@ def _estimate_metar_age_hours(raw_metar: str, now: datetime) -> int | None:
     return int(delta.total_seconds() // 3600)
 
 
-__all__ = ["format_wx_bundle"]
+def evaluate_station(
+    metars: Sequence[str],
+    now: datetime | None = None,
+) -> StationConditions:
+    """Return the flight category and METAR age for the provided reports."""
+
+    if not metars:
+        return StationConditions(None, None)
+
+    current_time = now or datetime.now(timezone.utc)
+    first_metar = metars[0]
+    visibility = _extract_visibility(first_metar)
+    ceiling = _extract_ceiling(first_metar)
+    category = _determine_flight_category(visibility, ceiling)
+    age_hours = _estimate_metar_age_hours(first_metar, current_time)
+
+    return StationConditions(category, age_hours)
+
+
+__all__ = ["format_wx_bundle", "evaluate_station", "StationConditions"]

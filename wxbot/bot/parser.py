@@ -23,4 +23,18 @@ def parse_icao_list(text: str) -> list[str]:
     return sorted(icaos)
 
 
-__all__ = ["parse_icao_list"]
+def parse_icao_sequence(text: str) -> list[str]:
+    """Extract ICAO identifiers preserving the input order."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in ICAO_PATTERN.finditer(text):
+        icao = match.group(1).upper()
+        if icao not in seen:
+            seen.add(icao)
+            ordered.append(icao)
+
+    return ordered
+
+
+__all__ = ["parse_icao_list", "parse_icao_sequence"]

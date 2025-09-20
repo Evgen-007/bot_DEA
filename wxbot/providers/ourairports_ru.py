@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -19,6 +19,8 @@ class AirportRecord(BaseModel):
     name: str = Field(default="")
     municipality: str = Field(default="")
     country: str = Field(min_length=2)
+    latitude_deg: float | None = Field(default=None)
+    longitude_deg: float | None = Field(default=None)
 
     def matches(self, haystack: str) -> bool:
         """Return ``True`` if the airport name or municipality appears in the haystack."""
@@ -59,4 +61,22 @@ def resolve_ru_tokens(text: str) -> list[str]:
     return sorted(matches)
 
 
-__all__ = ["resolve_ru_tokens", "_load_ru_index", "AirportRecord"]
+def get_airport(icao: str) -> AirportRecord | None:
+    """Return airport information for the given ICAO identifier."""
+
+    return _load_ru_index().get(icao.upper())
+
+
+def iter_airports() -> Iterator[AirportRecord]:
+    """Iterate over known Russian airports."""
+
+    yield from _load_ru_index().values()
+
+
+__all__ = [
+    "resolve_ru_tokens",
+    "_load_ru_index",
+    "AirportRecord",
+    "get_airport",
+    "iter_airports",
+]
